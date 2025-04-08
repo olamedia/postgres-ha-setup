@@ -1,0 +1,5 @@
+# Use scram-sha-256 hashes. Generate them on the primary DB:
+# SELECTCONCAT('"', usename, '" "', rolpassword, '"') FROM pg_shadow WHERE usename = 'myuser';
+# Replace the password below with the actual SCRAM hash from the DB.
+"myuser" "SCRAM-SHA-256$..."
+# Add other application users here

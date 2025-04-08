@@ -1,0 +1,161 @@
+version: '3.8'
+
+services:
+  db-primary:
+    image: postgres:15 # Use a specific version
+    container_name: db-primary
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # Use scram-sha-256 for security
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      PGDATA: /var/lib/postgresql/data/pgdata # Explicitly set PGDATA inside container
+    volumes:
+      - ./data/primary:/var/lib/postgresql/data/pgdata # Mount data to host
+      - ./config/primary/postgresql.conf:/etc/postgresql/postgresql.conf # Custom config
+      - ./config/primary/pg_hba.conf:/etc/postgresql/pg_hba.conf # Custom HBA
+      # Shared volumes for pgBackRest (simpler than SSH inside Docker for this setup)
+      - ./pgbackrest/log:/var/log/pgbackrest
+      - ./pgbackrest/conf:/etc/pgbackrest
+      - ./pgbackrest/repo:/pgbackrest-repo
+    ports:
+      # Only expose if needed directly from host, otherwise use pgbouncer/pgadmin
+      # - "127.0.0.1:5432:5432"
+      - "5432" # Expose only to other containers on the network by default
+    networks:
+      - db-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf -c hba_file=/etc/postgresql/pg_hba.conf
+
+  db-replica:
+    image: postgres:15 # Must match primary version
+    container_name: db-replica
+    restart: unless-stopped
+    environment:
+      # NO POSTGRES_DB/USER/PASSWORD here, it gets data via replication!
+      REPLICATION_USER: ${REPLICATION_USER}
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata # Explicit PGDATA
+    volumes:
+      - ./data/replica:/var/lib/postgresql/data/pgdata # Separate data volume
+      - ./config/replica/postgresql.conf:/etc/postgresql/postgresql.conf
+      - ./config/replica/pg_hba.conf:/etc/postgresql/pg_hba.conf
+      - ./config/replica/entrypoint-replica.sh:/usr/local/bin/entrypoint-replica.sh # Custom entrypoint
+      # Shared volumes for pgBackRest (if restoring to replica or using it for info)
+      - ./pgbackrest/log:/var/log/pgbackrest
+      - ./pgbackrest/conf:/etc/pgbackrest
+      - ./pgbackrest/repo:/pgbackrest-repo
+    ports:
+      # Only expose if needed directly from host for read-only tests
+      # - "127.0.0.1:5433:5432"
+      - "5432" # Expose only to other containers
+    networks:
+      - db-network
+    depends_on:
+      db-primary:
+        condition: service_healthy # Wait for primary healthcheck
+    entrypoint: ["/usr/local/bin/entrypoint-replica.sh"] # Use custom script
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf -c hba_file=/etc/postgresql/pg_hba.conf
+
+  pgbouncer:
+    image: bitnami/pgbouncer:latest # Well-maintained pgbouncer image
+    container_name: pgbouncer
+    restart: unless-stopped
+    environment:
+      # These are often used by the image's scripts, but main config is via files
+      PGBOUNCER_AUTH_TYPE: scram-sha-256
+      PGBOUNCER_DATABASE: ${POSTGRES_DB} # Needs to know a target DB
+      PGBOUNCER_AUTH_USER: pgbouncer_auth # User specified in pgbouncer.ini for internal auth
+      PGBOUNCER_AUTH_QUERY: "SELECT usename, rolpassword FROM pg_shadow WHERE usename=$1" # Needed for SCRAM
+      # Define credentials for the PGBOUNCER_AUTH_USER here if image requires it
+      # PGBOUNCER_AUTH_USER_USERNAME: pgbouncer_auth
+      # PGBOUNCER_AUTH_USER_PASSWORD: 'the_internal_password_you_set'
+    volumes:
+      - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini
+      - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt
+    ports:
+      - "6432:6432" # Standard PgBouncer port - APPS CONNECT HERE
+    networks:
+      - db-network
+    depends_on:
+      - db-primary # Needs primary to connect
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
+      PGADMIN_LISTEN_PORT: 80 # Port inside the container
+    volumes:
+      - ./pgadmin-data:/var/lib/pgadmin # Persist pgAdmin config/servers
+    ports:
+      - "8080:80" # Access pgAdmin via http://localhost:8080
+    networks:
+      - db-network
+    depends_on:
+      - db-primary # Wait for primary before starting
+
+  pgbackrest:
+    # Use official or community image - might need features like SSH if not using shared volumes fully
+    image: pgbackrest/pgbackrest:latest
+    container_name: pgbackrest
+    # This container is primarily for running commands via 'docker exec'
+    # Or you could add cron and run scheduled backups from here
+    restart: unless-stopped
+    volumes:
+      - ./pgbackrest/conf:/etc/pgbackrest
+      - ./pgbackrest/log:/var/log/pgbackrest
+      - ./pgbackrest/repo:/pgbackrest-repo # Backup data on host
+      # Mount primary/replica data dirs IF needed for local operations (less common)
+      # - ./data/primary:/var/lib/postgresql/data/primary:ro
+      # - ./data/replica:/var/lib/postgresql/data/replica:ro
+    environment:
+      # Pass passphrase if using encrypted repo
+      PGBACKREST_REPO1_CIPHER_PASS: ${PGBACKREST_REPO1_CIPHER_PASS:-} # Optional from .env
+    networks:
+      - db-network
+    depends_on:
+      - db-primary
+    # Keep container running - used via exec or internal cron
+    command: ["tail", "-f", "/dev/null"] # Simple way to keep it alive
+
+networks:
+  db-network:
+    driver: bridge
+
+volumes:
+  # Although we map to host paths, defining them here helps Docker manage them
+  # You can remove these if you ONLY want direct host paths without Docker volume metadata
+  pgdata-primary:
+    driver_opts:
+      type: none
+      device: ${PWD}/data/primary # Use absolute path expansion
+      o: bind
+  pgdata-replica:
+    driver_opts:
+      type: none
+      device: ${PWD}/data/replica
+      o: bind
+  pgadmin-data:
+    driver_opts:
+      type: none
+      device: ${PWD}/pgadmin-data
+      o: bind
+  pgbackrest-repo:
+    driver_opts:
+      type: none
+      device: ${PWD}/pgbackrest/repo
+      o: bind
+# Note: Volume definitions using driver_opts like this might be less portable than
+# simple host mounts defined directly in the service volume section. The example above
+# uses direct host mounts in the services for clarity, as requested.
+# Remove the 'volumes:' block at the end if using only direct host paths in services.
